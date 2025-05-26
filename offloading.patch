@@ -1,8 +1,18 @@
 diff --git a/tensorrt_llm/_torch/models/modeling_deepseekv3.py b/tensorrt_llm/_torch/models/modeling_deepseekv3.py
-index 687b5ab5a..a24d6ab87 100644
+index 96a76deb5..ff19fc234 100644
 --- a/tensorrt_llm/_torch/models/modeling_deepseekv3.py
 +++ b/tensorrt_llm/_torch/models/modeling_deepseekv3.py
-@@ -339,11 +339,13 @@ class Deepseekv3MoE(nn.Module):
+@@ -61,7 +61,8 @@ from ..utils import (AuxStreamType, EventType, Fp4QuantizedTensor,
+                      disable_fp4_allgather)
+ from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
+                              EagerFusionConfig, register_auto_model)
+-
++from ...quantization.utils.fp4_utils import float4_sf_dtype
++FUSED_MOE_NVFP4_WEIGHT_DTYPE = torch.int64
+ 
+ @triton.jit
+ def weight_dequant_kernel(x_ptr, s_ptr, y_ptr, M, N, BLOCK_SIZE: tl.constexpr):
+@@ -339,11 +340,13 @@ class Deepseekv3MoE(nn.Module):
                   shared_expert_intermediate_size: int,
                   aux_stream_dict: Dict[AuxStreamType, torch.cuda.Stream],
                   dtype: Optional[torch.dtype] = None,
@@ -16,7 +26,7 @@ index 687b5ab5a..a24d6ab87 100644
          self.top_k = top_k
          self.use_dp = model_config.mapping.enable_attention_dp
          self.enable_alltoall = Deepseekv3MoE.should_enable_alltoall(
-@@ -370,6 +372,7 @@ class Deepseekv3MoE(nn.Module):
+@@ -370,6 +373,7 @@ class Deepseekv3MoE(nn.Module):
              reduce_results=
              False,  # In both low‑latency and attention‑DP modes, FusedMoE skips the in‑op all‑reduce.
              model_config=model_config,
@@ -24,20 +34,23 @@ index 687b5ab5a..a24d6ab87 100644
              aux_stream=aux_stream_dict[AuxStreamType.MoeChunkingOverlap],
              enable_alltoall=self.enable_alltoall)
  
-@@ -455,6 +458,12 @@ class Deepseekv3MoE(nn.Module):
+@@ -455,7 +459,14 @@ class Deepseekv3MoE(nn.Module):
          return True
  
      def compute_routed_output(self, hidden_states, hidden_states_fp4,
+-                              all_rank_num_tokens, cutlass_min_latency_mode):
++                              all_rank_num_tokens, cutlass_min_latency_mode,
 +                              offloading: bool = False,
 +                              pingpong: int = None,
 +                              w3_w1_weight_pingpong: List=[],
 +                              w2_weight_pingpong: List=[],
 +                              host_weights: dict={},
 +                              offloading_stream: torch.cuda.Stream=None,
-                               all_rank_num_tokens, cutlass_min_latency_mode):
++                              event: torch.cuda.Event=None):
          # max-throughput
          use_dp_padding = False
-@@ -476,15 +485,32 @@ class Deepseekv3MoE(nn.Module):
+         if self.use_dp and self.mapping.tp_size > 1:
+@@ -476,15 +487,32 @@ class Deepseekv3MoE(nn.Module):
                      (0, 0, 0, max_num_token - hidden_states.shape[0]))
  
          router_logits = self.gate(hidden_states)
@@ -61,8 +74,8 @@ index 687b5ab5a..a24d6ab87 100644
 +                                         w3_w1_weight_pingpong = w3_w1_weight_pingpong,
 +                                         w2_weight_pingpong = w2_weight_pingpong,
 +                                         host_weights = host_weights,
-+                                         offloading_stream = offloading_stream                                         
-+                                        )
++                                         offloading_stream = offloading_stream,
++                                         event = event)
 +        else:
 +            routed_output = self.experts(hidden_states_fp4 or hidden_states,
 +                                         router_logits,
@@ -72,14 +85,14 @@ index 687b5ab5a..a24d6ab87 100644
 +                                         use_dp_padding=use_dp_padding)
 +
 +        if offloading:
-+            routed_output, pingpong = routed_output
-+            return routed_output, pingpong
++            routed_output, pingpong, event = routed_output
++            return routed_output, pingpong, event
 +        else:
 +            return routed_output
  
      def forward(
          self,
-@@ -493,6 +519,11 @@ class Deepseekv3MoE(nn.Module):
+@@ -493,6 +521,12 @@ class Deepseekv3MoE(nn.Module):
          all_rank_num_tokens: Optional[list[int]] = None,
          final_all_reduce_params: Optional[AllReduceParams] = None,
          cutlass_min_latency_mode: Optional[bool] = False,
@@ -88,10 +101,11 @@ index 687b5ab5a..a24d6ab87 100644
 +        w2_weight_pingpong: List=[],
 +        host_weights: dict={},
 +        offloading_stream: torch.cuda.Stream=None,
++        event: torch.cuda.Event=None,
      ) -> torch.Tensor:
          if cutlass_min_latency_mode:
              assert not self.use_dp
-@@ -505,15 +536,28 @@ class Deepseekv3MoE(nn.Module):
+@@ -505,15 +539,29 @@ class Deepseekv3MoE(nn.Module):
              return shared_output
  
          def _compute_routed_output():
@@ -107,7 +121,8 @@ index 687b5ab5a..a24d6ab87 100644
 +                    w3_w1_weight_pingpong = w3_w1_weight_pingpong,
 +                    w2_weight_pingpong = w2_weight_pingpong,
 +                    host_weights = host_weights,
-+                    offloading_stream = offloading_stream)
++                    offloading_stream = offloading_stream,
++                    event = event)
 +            else:
 +                routed_output = self.compute_routed_output(
 +                    hidden_states, hidden_states_fp4, all_rank_num_tokens,
@@ -119,17 +134,17 @@ index 687b5ab5a..a24d6ab87 100644
              self.event_dict[EventType.Main],
              self.event_dict[EventType.MoeShared], self.aux_stream)
 +        if self.offloading:
-+            routed_output, pingpong = routed_output
++            routed_output, pingpong, event = routed_output
  
          if cutlass_min_latency_mode:
              return [shared_output, *routed_output]
-@@ -526,15 +570,19 @@ class Deepseekv3MoE(nn.Module):
+@@ -526,15 +574,19 @@ class Deepseekv3MoE(nn.Module):
                      final_hidden_states,
                      all_reduce_params=final_all_reduce_params)
  
 -            return final_hidden_states
 +            if self.offloading:
-+                return final_hidden_states, pingpong
++                return final_hidden_states, pingpong, event
 +            else:
 +                return final_hidden_states
  
@@ -145,7 +160,7 @@ index 687b5ab5a..a24d6ab87 100644
          self.model_config = model_config
          config = model_config.pretrained_config
  
-@@ -580,6 +628,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
+@@ -580,6 +632,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                  self.num_shared_experts,
                  dtype=config.torch_dtype,
                  model_config=model_config,
@@ -153,7 +168,7 @@ index 687b5ab5a..a24d6ab87 100644
                  aux_stream_dict=aux_stream_dict)
          else:
              block_size = 1
-@@ -659,8 +708,19 @@ class DeepseekV3DecoderLayer(DecoderLayer):
+@@ -660,8 +713,21 @@ class DeepseekV3DecoderLayer(DecoderLayer):
          hidden_states: torch.Tensor,
          attn_metadata: AttentionMetadata,
          residual: torch.Tensor,
@@ -162,18 +177,20 @@ index 687b5ab5a..a24d6ab87 100644
 +        w2_weight_pingpong: List=[],
 +        host_weights: dict={},
 +        offloading_stream: torch.cuda.Stream=None,
++        event: torch.cuda.Event=None,
          **kwargs,
      ) -> torch.Tensor:
-+        device = torch.device('cuda')
-+        if self.layer_idx == 0:
++        if self.layer_idx == 0 and self.offloading:
++            assert event is not None
 +            with torch.cuda.stream(offloading_stream):
-+                w3_w1_weight_pingpong[pingpong] = host_weights["w3_w1_weight"].to(device, non_blocking=True)
-+                w2_weight_pingpong[pingpong] = host_weights["w2_weight"].to(device, non_blocking=True)
++                w3_w1_weight_pingpong[pingpong].copy_(host_weights["w3_w1_weight"], non_blocking=True)
++                w2_weight_pingpong[pingpong].copy_(host_weights["w2_weight"], non_blocking=True)
++                event.record()
 +
          if residual is None:
              residual = hidden_states
              hidden_states = self.input_layernorm(hidden_states)
-@@ -680,19 +740,30 @@ class DeepseekV3DecoderLayer(DecoderLayer):
+@@ -680,19 +746,32 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                  hidden_states=hidden_states,
                  attn_metadata=attn_metadata,
                  residual=residual,
@@ -182,6 +199,7 @@ index 687b5ab5a..a24d6ab87 100644
 +                w2_weight_pingpong=w2_weight_pingpong,
 +                host_weights=host_weights,
 +                offloading_stream=offloading_stream,
++                event=event,
              )
          else:
              assert isinstance(self.mlp, GatedMLP)
@@ -190,7 +208,7 @@ index 687b5ab5a..a24d6ab87 100644
                  hidden_states=hidden_states,
                  residual=residual,
              )
-+            return hidden_states, residual, pingpong
++            return hidden_states, residual, pingpong, event
  
      def forward_MoE(
          self,
@@ -202,10 +220,11 @@ index 687b5ab5a..a24d6ab87 100644
 +        w2_weight_pingpong: List=[],
 +        host_weights: dict={},
 +        offloading_stream: torch.cuda.Stream=None,
++        event: torch.cuda.Event=None,
      ) -> torch.Tensor:
  
          def _run_MoE(hidden_states, hidden_states_fp4):
-@@ -704,6 +775,11 @@ class DeepseekV3DecoderLayer(DecoderLayer):
+@@ -704,6 +783,12 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                      enable_allreduce=not (self.fusion_config.POST_MOE_FUSION
                                            or self.mapping.tp_size == 1)),
                  cutlass_min_latency_mode=cutlass_min_latency_mode,
@@ -214,32 +233,33 @@ index 687b5ab5a..a24d6ab87 100644
 +                w2_weight_pingpong = w2_weight_pingpong,
 +                host_weights = host_weights,
 +                offloading_stream = offloading_stream,
++                event = event,
              )
  
          cutlass_min_latency_mode = self._enable_min_latency_mode(
-@@ -762,6 +838,8 @@ class DeepseekV3DecoderLayer(DecoderLayer):
+@@ -762,6 +847,8 @@ class DeepseekV3DecoderLayer(DecoderLayer):
  
              hidden_states = _run_MoE(hidden_states, hidden_states_fp4=None)
  
 +            if self.offloading:
-+                hidden_states, pingpong = hidden_states
++                hidden_states, pingpong, event = hidden_states
              if self.fusion_config.POST_MOE_FUSION:
                  hidden_states, residual = self.allreduce(
                      hidden_states,
-@@ -776,7 +854,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
+@@ -776,7 +863,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                      hidden_states, residual = self.next_layer_layernorm(
                          hidden_states, residual)
  
 -        return hidden_states, residual
-+        return hidden_states, residual, pingpong
++        return hidden_states, residual, pingpong, event
  
      def forward_mlp(
          self,
-@@ -948,14 +1026,48 @@ class DeepseekV3Model(DecoderModel):
+@@ -952,14 +1039,82 @@ class DeepseekV3Model(DecoderModel):
              dtype=config.torch_dtype,
          )
  
-+        self.offloading_stride = 4
++        self.offloading_stride = 1
          self.layers = nn.ModuleList([
              DeepseekV3DecoderLayer(model_config, layer_idx,
 -                                   self.aux_stream_dict)
@@ -250,21 +270,57 @@ index 687b5ab5a..a24d6ab87 100644
          self.norm = RMSNorm(hidden_size=config.hidden_size,
                              eps=config.rms_norm_eps,
                              dtype=config.torch_dtype)
-+        self.offloading_stream = torch.cuda.Stream()
++        device = torch.cuda.current_device()
++        self.offloading_stream = torch.cuda.Stream(device=device)
++
 +        self.offloading_layer_idx = []
 +        for i in range(len(self.layers)):
 +            if isinstance(self.layers[i].mlp, Deepseekv3MoE) and self.layers[i].offloading:
++                fused_moe = self.layers[i].mlp.experts
++                qm = fused_moe.quant_config.quant_mode
++
 +                if self.offloading_layer_idx == []:
-+                    w3_w1_weight_shape = (self.layers[i].mlp.experts.expert_size_per_partition,
-+                                          self.layers[i].mlp.experts.intermediate_size_per_partition * 2,
-+                                          self.layers[i].mlp.experts.hidden_size)
++                    w3_w1_weight_shape = (fused_moe.expert_size_per_partition,
++                                          fused_moe.intermediate_size_per_partition * 2,
++                                          fused_moe.hidden_size)
 +                    w2_weight_shape = (
-+                        self.layers[i].mlp.experts.expert_size_per_partition,
-+                        self.layers[i].mlp.experts.hidden_size,
-+                        self.layers[i].mlp.experts.intermediate_size_per_partition,
++                        fused_moe.expert_size_per_partition,
++                        fused_moe.hidden_size,
++                        fused_moe.intermediate_size_per_partition,
 +                    )
-+                    weight_dtype = self.dtype
-+                    device = torch.device('cuda')
++                    weight_dtype = fused_moe.dtype
++
++                    if (qm.has_fp8_qdq() or qm.has_fp8_block_scales()):
++                        weight_dtype = torch.float8_e4m3fn
++                    elif qm.is_int4_weight_only_per_group:
++                        weight_dtype = torch.int8
++                        w3_w1_weight_shape = (
++                            fused_moe.expert_size_per_partition,
++                            fused_moe.intermediate_size_per_partition * 2,
++                            fused_moe.hidden_size // 2
++                        )
++                        w2_weight_shape = (
++                            fused_moe.expert_size_per_partition,
++                            fused_moe.hidden_size,
++                            fused_moe.intermediate_size_per_partition // 2
++                        )
++                    elif qm.has_nvfp4():
++                        if self.layers[i].mlp.experts.is_trtllm():
++                            weight_dtype = float4_sf_dtype
++                            weight_vec_size = torch.iinfo(weight_dtype).bits // 4
++                        else:
++                            weight_dtype = FUSED_MOE_NVFP4_WEIGHT_DTYPE
++                            weight_vec_size = torch.iinfo(weight_dtype).bits // 4
++
++                        w3_w1_weight_shape = (self.expert_size_per_partition,
++                                              self.intermediate_size_per_partition * 2,
++                                              self.hidden_size // weight_vec_size)
++                        w2_weight_shape = (self.expert_size_per_partition,
++                                           self.hidden_size,
++                                           self.intermediate_size_per_partition //
++                                           weight_vec_size)
++
++                    # device = torch.device('cuda')
 +                    self.w3_w1_weight_pingpong = [nn.Parameter(torch.empty(w3_w1_weight_shape,
 +                                                               dtype=weight_dtype,
 +                                                               device=device), requires_grad=False),
@@ -277,21 +333,20 @@ index 687b5ab5a..a24d6ab87 100644
 +                                               nn.Parameter(torch.empty(w2_weight_shape,
 +                                                               dtype=weight_dtype,
 +                                                               device=device), requires_grad=False)]
-+
-+                    print(w3_w1_weight_shape, w2_weight_shape)
 +                if (i-config.first_k_dense_replace)%self.offloading_stride == 0:
 +                    self.offloading_layer_idx.append(i)
 +        print("offloading layer: ", self.offloading_layer_idx)
  
      def forward(
          self,
-@@ -974,12 +1086,24 @@ class DeepseekV3Model(DecoderModel):
+@@ -978,13 +1133,27 @@ class DeepseekV3Model(DecoderModel):
  
          hidden_states = inputs_embeds
          residual = None
 +        pingpong_ = 0
 +        offloading_layer_idx_ = [tmp for tmp in self.offloading_layer_idx]
-+        moe_layer_idx = offloading_layer_idx_[0]        
++        moe_layer_idx = offloading_layer_idx_[0]
++        event = torch.cuda.Event()
  
          for decoder_layer in self.layers[:self.num_hidden_layers]:
 -            hidden_states, residual = decoder_layer(
@@ -299,7 +354,7 @@ index 687b5ab5a..a24d6ab87 100644
 +                if decoder_layer.layer_idx == offloading_layer_idx_[0]:
 +                    del(offloading_layer_idx_[0])
 +                    moe_layer_idx = offloading_layer_idx_[0]
-+            hidden_states, residual, pingpong_ = decoder_layer(
++            hidden_states, residual, pingpong_, event = decoder_layer(
                  position_ids=position_ids,
                  hidden_states=hidden_states,
                  attn_metadata=attn_metadata,
@@ -309,13 +364,15 @@ index 687b5ab5a..a24d6ab87 100644
 +                offloading_stream=self.offloading_stream,
 +                pingpong=pingpong_,
                  residual=residual,
++                event=event,
              )
  
+         return hidden_states
 diff --git a/tensorrt_llm/_torch/modules/fused_moe.py b/tensorrt_llm/_torch/modules/fused_moe.py
-index 5b2b89d89..511fee2e1 100755
+index 2fbd2d28a..62975f4bf 100755
 --- a/tensorrt_llm/_torch/modules/fused_moe.py
 +++ b/tensorrt_llm/_torch/modules/fused_moe.py
-@@ -281,6 +281,7 @@ class FusedMoE(nn.Module):
+@@ -359,6 +359,7 @@ class FusedMoE(nn.Module):
          num_experts: int,
          hidden_size: int,
          intermediate_size: int,
@@ -323,7 +380,7 @@ index 5b2b89d89..511fee2e1 100755
          dtype: Optional[torch.dtype] = None,
          reduce_results: bool = False,
          model_config: ModelConfig = ModelConfig(),
-@@ -293,6 +294,7 @@ class FusedMoE(nn.Module):
+@@ -371,6 +372,7 @@ class FusedMoE(nn.Module):
          from ..distributed import AllReduce
  
          super().__init__()
@@ -331,7 +388,7 @@ index 5b2b89d89..511fee2e1 100755
          self.routing_method = routing_method
          self.num_experts = num_experts
          self.hidden_size = hidden_size
-@@ -372,6 +374,7 @@ class FusedMoE(nn.Module):
+@@ -464,6 +466,7 @@ class FusedMoE(nn.Module):
              model_config.mapping) if enable_alltoall else None
  
          self._weights_created = False
@@ -339,10 +396,11 @@ index 5b2b89d89..511fee2e1 100755
          if not model_config.skip_create_weights_in_init:
              self.create_weights()
  
-@@ -710,17 +713,32 @@ class FusedMoE(nn.Module):
+@@ -801,18 +804,32 @@ class FusedMoE(nn.Module):
+                 raise ValueError(
                      f"unsupported quantization mode: {qc.quant_mode}")
              self.setup_quant_scales()
- 
+-
 -        # Fused gate_up_proj (column parallel)
 -        w3_w1_weight = nn.Parameter(torch.empty(w3_w1_weight_shape,
 -                                                dtype=weight_dtype),
@@ -383,19 +441,16 @@ index 5b2b89d89..511fee2e1 100755
          self._weights_created = True
  
      def reducescatter_or_allreduce(
-@@ -749,6 +767,11 @@ class FusedMoE(nn.Module):
+@@ -841,6 +858,8 @@ class FusedMoE(nn.Module):
          output_dtype: Optional[torch.dtype] = None,
          all_rank_num_tokens: Optional[List[int]] = None,
          use_dp_padding: Optional[bool] = None,
-+        pingpong: int=None,
-+        w3_w1_weight_pingpong: List=[],
-+        w2_weight_pingpong: List=[],
-+        host_weights: dict={},
-+        offloading_stream: torch.cuda.Stream=None
++        w3_w1_weight_device: Optional[torch.Tensor] = None,
++        w2_weight_device: Optional[torch.Tensor] = None,
      ) -> torch.Tensor:
          if isinstance(x, Fp4QuantizedTensor):
              assert output_dtype is not None
-@@ -758,7 +781,7 @@ class FusedMoE(nn.Module):
+@@ -850,7 +869,7 @@ class FusedMoE(nn.Module):
  
          use_fp8_block_scaling = False
          use_w4a8_group_scaling = False
@@ -404,27 +459,7 @@ index 5b2b89d89..511fee2e1 100755
  
          token_selected_experts, token_final_scales = self.routing_method.apply(
              router_logits)
-@@ -833,6 +856,19 @@ class FusedMoE(nn.Module):
-                 x_sf = reswizzle_sf(x_sf, x_row, x_col,
-                                     self.scaling_vector_size)
- 
-+        if self.offloading:
-+            offloading_stream.synchronize()
-+            w3_w1_weight_device = w3_w1_weight_pingpong[pingpong]
-+            w2_weight_device = w2_weight_pingpong[pingpong]
-+    
-+            # if offloading_layer_idx != []:
-+            if host_weights is not None:
-+                pingpong = 0 if pingpong == 1 else 1
-+                device = torch.device('cuda')
-+                with torch.cuda.stream(offloading_stream):
-+                    w3_w1_weight_pingpong[pingpong] = host_weights["w3_w1_weight"].to(device, non_blocking=True)
-+                    w2_weight_pingpong[pingpong] = host_weights["w2_weight"].to(device, non_blocking=True)
-+
-         if self.smart_router and not cutlass_min_latency_mode:
-             ep_size = self.cluster_size
-             ep_rank = self.cluster_rank
-@@ -849,8 +885,8 @@ class FusedMoE(nn.Module):
+@@ -941,8 +960,8 @@ class FusedMoE(nn.Module):
          else:
              ep_size = self.ep_size
              ep_rank = self.ep_rank
@@ -435,19 +470,7 @@ index 5b2b89d89..511fee2e1 100755
              cluster_size = self.cluster_size
              cluster_rank = self.cluster_rank
              quant_scales = self.quant_scales
-@@ -889,7 +925,10 @@ class FusedMoE(nn.Module):
-             final_hidden_states = final_hidden_states[0]
- 
-         if not self.enable_alltoall:
--            return final_hidden_states
-+            if self.offloading:
-+                return final_hidden_states, pingpong
-+            else:
-+                return final_hidden_states
-         else:
-             return self.alltoall_combine(final_hidden_states, alltoall_info,
-                                          token_count)
-@@ -902,6 +941,11 @@ class FusedMoE(nn.Module):
+@@ -994,6 +1013,12 @@ class FusedMoE(nn.Module):
          output_dtype: Optional[torch.dtype] = None,
          all_rank_num_tokens: Optional[List[int]] = None,
          use_dp_padding: Optional[bool] = None,
@@ -455,11 +478,12 @@ index 5b2b89d89..511fee2e1 100755
 +        w3_w1_weight_pingpong: List=[],
 +        w2_weight_pingpong: List=[],
 +        host_weights: dict={},
-+        offloading_stream: torch.cuda.Stream=None
++        offloading_stream: torch.cuda.Stream=None,
++        event: torch.cuda.Event=None,
      ) -> torch.Tensor:
          """
          cutlass_min_latency_mode has no effect when trtllm_gen backend is enabled.
-@@ -909,7 +953,12 @@ class FusedMoE(nn.Module):
+@@ -1001,7 +1026,13 @@ class FusedMoE(nn.Module):
          if self.is_cutlass():
              return self.forward_cutlass(x, router_logits,
                                          cutlass_min_latency_mode, output_dtype,
@@ -469,11 +493,12 @@ index 5b2b89d89..511fee2e1 100755
 +                                        w3_w1_weight_pingpong,
 +                                        w2_weight_pingpong,
 +                                        host_weights,
-+                                        offloading_stream)
++                                        offloading_stream,
++                                        event=event)
          elif self.is_trtllm():
              return self.forward_trtllmgen(x, router_logits)
          else:
-@@ -925,6 +974,11 @@ class FusedMoE(nn.Module):
+@@ -1017,6 +1048,12 @@ class FusedMoE(nn.Module):
          output_dtype: Optional[torch.dtype] = None,
          all_rank_num_tokens: Optional[List[int]] = None,
          use_dp_padding: Optional[bool] = None,
@@ -482,84 +507,82 @@ index 5b2b89d89..511fee2e1 100755
 +        w2_weight_pingpong: List=[],
 +        host_weights: dict={},
 +        offloading_stream: torch.cuda.Stream=None,
++        event: torch.cuda.Event=None,
      ) -> torch.Tensor:
          assert self.is_cutlass()
  
-@@ -955,7 +1009,14 @@ class FusedMoE(nn.Module):
+@@ -1040,6 +1077,19 @@ class FusedMoE(nn.Module):
+                                           ] * len(all_rank_num_tokens)
+         else:
+             all_rank_num_tokens_padded = all_rank_num_tokens
++
++        if self.offloading:
++            event.wait(offloading_stream)
++            w3_w1_weight_device = w3_w1_weight_pingpong[pingpong]
++            w2_weight_device = w2_weight_pingpong[pingpong]
++    
++            if host_weights is not None:
++                pingpong = 0 if pingpong == 1 else 1
++                with torch.cuda.stream(offloading_stream):
++                    w3_w1_weight_pingpong[pingpong].copy_(host_weights["w3_w1_weight"], non_blocking=True)
++                    w2_weight_pingpong[pingpong].copy_(host_weights["w2_weight"], non_blocking=True)
++                    event.record()
++
+         if num_chunks == 1:
+             outputs = self.forward_chunk(
+                 x,
+@@ -1047,6 +1097,8 @@ class FusedMoE(nn.Module):
                  cutlass_min_latency_mode,
                  output_dtype,
                  all_rank_num_tokens=all_rank_num_tokens_padded,
-+                pingpong=pingpong,
-+                w3_w1_weight_pingpong=w3_w1_weight_pingpong,
-+                w2_weight_pingpong=w2_weight_pingpong,
-+                host_weights=host_weights,
-+                offloading_stream=offloading_stream,
++                w3_w1_weight_device=w3_w1_weight_device,
++                w2_weight_device=w2_weight_device,
                  use_dp_padding=use_dp_padding)
-+            if self.offloading:
-+                outputs, pingpong = outputs
              outputs = self.reducescatter_or_allreduce(
                  outputs,
-                 all_rank_num_tokens=all_rank_num_tokens_padded,
-@@ -1006,7 +1067,14 @@ class FusedMoE(nn.Module):
+@@ -1098,6 +1150,8 @@ class FusedMoE(nn.Module):
                                  router_logits,
                                  all_rank_num_tokens=all_rank_num_tokens_list[
                                      idx_chunk] if self.use_dp else None,
-+                                pingpong=pingpong,
-+                                w3_w1_weight_pingpong=w3_w1_weight_pingpong,
-+                                w2_weight_pingpong=w2_weight_pingpong,
-+                                host_weights=host_weights,
-+                                offloading_stream=offloading_stream,
++                                w3_w1_weight_device=w3_w1_weight_device,
++                                w2_weight_device=w2_weight_device,
                                  use_dp_padding=use_dp_padding)
-+                            if self.offloading:
-+                                outputs, pingpong = outputs
                          if idx_chunk > 0:
                              outputs_list[-1] = self.reducescatter_or_allreduce(
-                                 outputs_list[-1],
-@@ -1019,7 +1087,14 @@ class FusedMoE(nn.Module):
+@@ -1111,6 +1165,8 @@ class FusedMoE(nn.Module):
                              router_logits,
                              all_rank_num_tokens=all_rank_num_tokens_list[
                                  idx_chunk] if self.use_dp else None,
-+                            pingpong=pingpong,
-+                            w3_w1_weight_pingpong=w3_w1_weight_pingpong,
-+                            w2_weight_pingpong=w2_weight_pingpong,
-+                            host_weights=host_weights,
-+                            offloading_stream=offloading_stream,
++                            w3_w1_weight_device=w3_w1_weight_device,
++                            w2_weight_device=w2_weight_device,
                              use_dp_padding=use_dp_padding)
-+                        if self.offloading:
-+                            outputs, pingpong = outputs
                          with torch.cuda.stream(self.aux_stream):
                              outputs_list[-1] = self.reducescatter_or_allreduce(
-                                 outputs_list[-1],
-@@ -1031,8 +1106,14 @@ class FusedMoE(nn.Module):
+@@ -1123,8 +1179,9 @@ class FusedMoE(nn.Module):
                          x,
                          router_logits,
                          all_rank_num_tokens=all_rank_num_tokens_list[idx_chunk]
 -                        if self.use_dp else None)
 -
 +                        if self.use_dp else None,
-+                        pingpong=pingpong,
-+                        w3_w1_weight_pingpong=w3_w1_weight_pingpong,
-+                        w2_weight_pingpong=w2_weight_pingpong,
-+                        host_weights=host_weights,
-+                        offloading_stream=offloading_stream)
-+                    if self.offloading:
-+                        outputs, pingpong = outputs
++                        w3_w1_weight_device=w3_w1_weight_device,
++                        w2_weight_device=w2_weight_device)
                  outputs_list.append(outputs)
              if not self.enable_alltoall:
                  if num_chunks % 2 == 0:
-@@ -1053,7 +1134,10 @@ class FusedMoE(nn.Module):
+@@ -1145,7 +1202,10 @@ class FusedMoE(nn.Module):
          if self.use_dp:
              rank = self.mapping.tp_rank
              outputs = outputs[:all_rank_num_tokens[rank]]
 -        return outputs
 +        if self.offloading:
-+            return outputs, pingpong
++            return outputs, pingpong, event
 +        else:
 +            return outputs
  
      def forward_trtllmgen(self, x: torch.Tensor,
                            router_logits: torch.Tensor) -> torch.Tensor:
-@@ -1305,6 +1389,7 @@ class FusedMoE(nn.Module):
+@@ -1445,6 +1505,7 @@ class FusedMoE(nn.Module):
  
              thread = threading.Thread(target=load_expert_w3_w1_weight,
                                        args=(w1_weight, w3_weight,
@@ -567,7 +590,7 @@ index 5b2b89d89..511fee2e1 100755
                                              self.w3_w1_weight.data[expert_idx],
                                              is_trtllm_nvfp4))
              thread.start()
-@@ -1312,6 +1397,7 @@ class FusedMoE(nn.Module):
+@@ -1452,6 +1513,7 @@ class FusedMoE(nn.Module):
  
              thread = threading.Thread(target=load_expert_w2_weight,
                                        args=(w2_weight,
