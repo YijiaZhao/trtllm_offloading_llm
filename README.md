@@ -2,7 +2,7 @@
 
 git clone https://github.com/NVIDIA/TensorRT-LLM.git
 
-git checkout 5b1c88de8dd997761feefb25382cfc7f951a34b2 
+git checkout 2b8f6d2871d122d1620c804cccf399d1ee26c966 
 
 git apply offloading.patch
 
