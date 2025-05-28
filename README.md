@@ -10,3 +10,5 @@ python TensorRT-LLM/examples/pytorch/quickstart_advanced.py --model_dir /raid/mi
 
 # step by step 
 docker run -it -P --gpus all --ipc=host --ulimit memlock=-1 --ulimit stack=67108864 --device=/dev/infiniband --shm-size="128g" -v /home/:/home --name="offloading" nvcr.io/nvidian/sae/tensorrt_llm_release_2025_5_26 /bin/bash
+
+cp -r ../../tensorrt_llm/* /usr/local/lib/python3.12/dist-packages/tensorrt_llm/![Uploading image.png…]()
