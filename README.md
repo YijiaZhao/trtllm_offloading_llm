@@ -11,4 +11,6 @@ python TensorRT-LLM/examples/pytorch/quickstart_advanced.py --model_dir /raid/mi
 # step by step 
 docker run -it -P --gpus all --ipc=host --ulimit memlock=-1 --ulimit stack=67108864 --device=/dev/infiniband --shm-size="128g" -v /home/:/home --name="offloading" nvcr.io/nvidian/sae/tensorrt_llm_release_2025_5_26 /bin/bash
 
+trtllm-bench --model deepseek-ai/DeepSeek-V3 --model_path ../sm89/  throughput --backend pytorch --max_batch_size 2 --max_num_tokens 1500 --dataset ../bench_data/i1000o1istd0ostd0num16384.txt --tp 8 --ep 8 --streaming --warmup 0 --num_requests 32 --concurrency 32 --kv_cache_free_gpu_mem_fraction 0.05 --extra_llm_api_options ../extra_llm_yml/extra-llm-api-config-offloading.yml 
+
 cp -r ../../tensorrt_llm/* /usr/local/lib/python3.12/dist-packages/tensorrt_llm/
