@@ -14,3 +14,7 @@ docker run -it  --gpus all --network=host --device=/dev/infiniband --ipc=host --
 trtllm-bench --model deepseek-ai/DeepSeek-V3 --model_path ../sm89/  throughput --backend pytorch --max_batch_size 2 --max_num_tokens 1500 --dataset ../bench_data/i1000o1istd0ostd0num16384.txt --tp 8 --ep 8 --streaming --warmup 0 --num_requests 32 --concurrency 32 --kv_cache_free_gpu_mem_fraction 0.05 --extra_llm_api_options ../extra_llm_yml/extra-llm-api-config-offloading.yml 
 
 cp -r ../../tensorrt_llm/* /usr/local/lib/python3.12/dist-packages/tensorrt_llm/
+
+# nsys
+export TLLM_PROFILE_START_STOP="5-25"
+nsys profile -t cuda,nvtx -c cudaProfilerApi --capture-range-end="repeat[]" --cuda-graph-trace=node -o ${nsys_save_dir}/trtllm-4node-i4096o128-${RANK}-${SLURM_PROCID} + script
