@@ -17,4 +17,5 @@ cp -r ../../tensorrt_llm/* /usr/local/lib/python3.12/dist-packages/tensorrt_llm/
 
 # nsys
 export TLLM_PROFILE_START_STOP="5-25"
+
 nsys profile -t cuda,nvtx -c cudaProfilerApi --capture-range-end="repeat[]" --cuda-graph-trace=node -o ${nsys_save_dir}/trtllm-4node-i4096o128-${RANK}-${SLURM_PROCID} + script
